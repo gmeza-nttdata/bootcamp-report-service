@@ -5,5 +5,6 @@ import reactor.core.publisher.Mono;
 
 public interface IStatementService<T,Id> {
 
-    Flux<T> getAllById(Id id);
+    Flux<T> getStatementsByNumber(Id number);
+    Flux<T> getStatements();
 }
