@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 @Component
 public class CreditWebService implements CreditService {
@@ -19,6 +20,13 @@ public class CreditWebService implements CreditService {
                             @Value("${bootcamp.web.credit: http://credit-service/accounts}") String URI) {
         this.webClientBuilder = webClientBuilder;
         this.URI = URI;
+    }
+
+    @Override
+    public Mono<Credit> get(String id) {
+        return webClientBuilder.build().get()
+                .uri(URI + "/{id}", id)
+                .retrieve().bodyToMono(Credit.class);
     }
 
     @Override

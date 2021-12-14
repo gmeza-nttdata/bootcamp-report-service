@@ -4,24 +4,30 @@ import com.nttdata.bootcamp.reportservice.application.ReportOperations;
 import com.nttdata.bootcamp.reportservice.application.service.*;
 import com.nttdata.bootcamp.reportservice.domain.FeeStatement;
 import com.nttdata.bootcamp.reportservice.domain.ProductAverageBalance;
+import com.nttdata.bootcamp.reportservice.domain.dto.AccountReportDto;
 import com.nttdata.bootcamp.reportservice.domain.dto.BaseStatement;
+import com.nttdata.bootcamp.reportservice.domain.dto.CreditReportDto;
 import com.nttdata.bootcamp.reportservice.domain.dto.ProductType;
 import com.nttdata.bootcamp.reportservice.domain.entity.AccountTransactionStatement;
+import com.nttdata.bootcamp.reportservice.domain.entity.AccountTransferStatement;
+import com.nttdata.bootcamp.reportservice.domain.entity.CreditTransactionStatement;
+import com.nttdata.bootcamp.reportservice.domain.entity.DebitCardStatement;
 import com.nttdata.bootcamp.reportservice.domain.entity.account.Account;
 import com.nttdata.bootcamp.reportservice.domain.entity.credit.Credit;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
-import java.math.MathContext;
 import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -34,6 +40,7 @@ public class ReportOperationsImpl implements ReportOperations {
     private final AccountTransactionService accountTransactionService;
     private final AccountTransferService accountTransferService;
     private final CreditTransactionService creditTransactionService;
+    private final DebitCardStatementService debitCardStatementService;
     private final AccountService accountService;
     private final CreditService creditService;
 
@@ -44,8 +51,13 @@ public class ReportOperationsImpl implements ReportOperations {
         // Get User accounts and credits first
         Flux<ProductAverageBalance> accountFlux = accountService.getAll()
                 .filter(account -> account.getUserId().equals(userId))
-                .flatMap(account -> accountTransactionService.getStatementsByNumber(account.getNumber())
-                                .map(BaseStatement::new)
+                .flatMap(account -> Flux.merge(
+                        accountTransactionService.getStatementsByNumber(account.getNumber())
+                                .map(BaseStatement::new),
+                        accountTransferService.getStatementsByNumber(account.getNumber())
+                                .map(s -> new BaseStatement(s, account.getNumber())),
+                        debitCardStatementService.getStatementsByNumber(account.getNumber())
+                                .map(BaseStatement::new))
                                 .filter(this::filterCurrentMonth)
                                 .collectList()
                                 .map(statements -> this.computeProductAverageBalance(statements, account)));
@@ -62,11 +74,71 @@ public class ReportOperationsImpl implements ReportOperations {
     }
 
     @Override
-    public Flux<FeeStatement> generateFeeReportByProductInRangeOfTime(LocalDate from, LocalDate to) {
-        // TODO: implement
-        return null;
+    public Mono<HashMap<String, BigDecimal>> generateFeeReportByProductInRangeOfTime(LocalDate from, LocalDate to) {
+        return Mono.zip(
+                accountTransactionService.getStatements()
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .map(AccountTransactionStatement::getFee)
+                        .doOnNext(f -> f = (f==null)?BigDecimal.ZERO:f)
+                        .reduce(BigDecimal::add),
+                accountTransferService.getStatements()
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .map(AccountTransferStatement::getFee)
+                        .doOnNext(f -> f = (f==null)?BigDecimal.ZERO:f)
+                        .reduce(BigDecimal::add),
+                debitCardStatementService.getStatements()
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .map(DebitCardStatement::getFee)
+                        .doOnNext(f -> f = (f==null)?BigDecimal.ZERO:f)
+                        .reduce(BigDecimal::add),
+                creditTransactionService.getStatements()
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .map(CreditTransactionStatement::getFee)
+                        .doOnNext(f -> f = (f==null)?BigDecimal.ZERO:f)
+                        .reduce(BigDecimal::add))
+                .map(tuple -> {
+                            HashMap<String, BigDecimal> map = new HashMap<>();
+                            map.put("Account", tuple.getT1().add(tuple.getT2()));
+                            map.put("Debit Card", tuple.getT3());
+                            map.put("Credit Card", tuple.getT4());
+                            return map;
+                        }
+                );
     }
 
+    @Override
+    public Mono<AccountReportDto> generateAccountReport(String id, LocalDate from, LocalDate to) {
+        return Mono.zip(
+                accountTransactionService.getStatementsByNumber(id)
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .collectList(),
+                debitCardStatementService.getStatementsByNumber(id)
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .collectList(),
+                accountTransferService.getStatementsByNumber(id)
+                        .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                        .collectList(),
+                accountService.get(id)
+        )
+                .map(tuple -> new AccountReportDto(tuple.getT4(), tuple.getT1(), tuple.getT2(), tuple.getT3()));
+    }
+
+    @Override
+    public Mono<CreditReportDto> generateCreditReport(String id, LocalDate from, LocalDate to) {
+        return creditService.get(id)
+                .flatMap(credit ->
+                    creditTransactionService.getStatementsByNumber(id)
+                            .filter(s -> filterStatementByDateRange(s.getDateTime(), from, to))
+                            .collectList()
+                            .map(statements -> new CreditReportDto(credit, statements))
+                );
+    }
+
+    private boolean filterStatementByDateRange(LocalDateTime dateTime, LocalDate from, LocalDate to) {
+        LocalDate date = dateTime.toLocalDate();
+        return date.equals(from) || date.equals(to) || date.isAfter(from) || date.isBefore(to);
+
+    }
 
     private ProductAverageBalance computeProductAverageBalance
             (List<BaseStatement> statements, Account account) {
@@ -74,6 +146,7 @@ public class ReportOperationsImpl implements ReportOperations {
                 ProductType.ACCOUNT + ": " + account.getType(),
                 account.getBalance());
     }
+
     private ProductAverageBalance computeProductAverageBalance
             (List<BaseStatement> statements, Credit credit) {
         return computeProductAverageBalance(statements, credit.getNumber(),
@@ -103,11 +176,11 @@ public class ReportOperationsImpl implements ReportOperations {
             int idx = statement.getDateTime().getDayOfMonth() - 1;
             BigDecimal partialBalance;
             switch (statement.getOperationType()) {
-                case PAYMENT:
+                case CREDIT_PAYMENT:
                 case DEPOSIT:
                     partialBalance = operationList.get(idx).add(statement.getAmount());
                     break;
-                case CONSUMPTION:
+                case PAYMENT:
                 case WITHDRAWAL:
                     partialBalance = operationList.get(idx).subtract(statement.getAmount());
                     break;
